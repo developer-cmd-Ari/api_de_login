@@ -1,0 +1,9 @@
+# Archivo de entorno (contiene secretos)
+.env
+
+# Carpetas de caché de Python
+__pycache__/
+*.pyc
+
+# Carpeta de configuración del editor de código
+.vscode/
