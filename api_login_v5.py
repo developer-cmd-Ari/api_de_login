@@ -34,12 +34,14 @@ load_dotenv()
 JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY')
 JWT_ALGORITHM = os.getenv('JWT_ALGORITHM', 'HS256')
 
-DB_SERVER = os.getenv('DB_SERVER')
+DB_HOST = os.getenv('DB_HOST')
 DB_DATABASE = os.getenv('DB_DATABASE')
-DB_DRIVER = os.getenv('DB_DRIVER')
-DB_CONNECTION_TYPE = os.getenv('DB_CONNECTION_TYPE')
 DB_UID = os.getenv('DB_UID')
 DB_PWD = os.getenv('DB_PWD')
+DB_PORT = os.getenv('DB_PORT', '5432') # Puerto por defecto de PostgreSQL
+DB_DRIVER = os.getenv('DB_DRIVER', '{ODBC Driver 13 for PostgreSQL}') # O el driver que uses
+
+
 
 # --- NUEVO: Configuración SMTP ---
 SMTP_SERVER = os.getenv('SMTP_SERVER')
@@ -54,8 +56,8 @@ SMTP_USE_SSL = os.getenv('SMTP_USE_SSL', 'False').lower() in ('true', '1', 't')
 # --- Validar configuración esencial ---
 if not JWT_SECRET_KEY:
     raise ValueError("No se encontró JWT_SECRET_KEY en .env")
-if not DB_SERVER or not DB_DATABASE or not DB_DRIVER:
-     raise ValueError("Faltan variables de configuración de base de datos en .env")
+if not DB_HOST or not DB_DATABASE or not DB_UID or not DB_PWD:
+     raise ValueError("Faltan variables de configuración de base de datos para PostgreSQL en .env")
 # --- NUEVO: Validar Config SMTP ---
 smtp_configured = all([SMTP_SERVER, SMTP_PORT, SMTP_SENDER_EMAIL, SMTP_SENDER_PASSWORD])
 if not smtp_configured:
@@ -67,17 +69,9 @@ if not smtp_configured:
 # --- FIN NUEVO ---
 
 # --- Construir la cadena de conexión ---
-CONNECTION_STRING = ""
-if DB_CONNECTION_TYPE == 'WINDOWS':
-    CONNECTION_STRING = f"DRIVER={DB_DRIVER};SERVER={DB_SERVER};DATABASE={DB_DATABASE};Trusted_Connection=yes;"
-elif DB_CONNECTION_TYPE == 'SQL':
-    if not DB_UID or not DB_PWD:
-        raise ValueError("Se requiere DB_UID y DB_PWD para la autenticación SQL en .env")
-    CONNECTION_STRING = f"DRIVER={DB_DRIVER};SERVER={DB_SERVER};DATABASE={DB_DATABASE};UID={DB_UID};PWD={DB_PWD};"
-else:
-    raise ValueError("DB_CONNECTION_TYPE debe ser 'WINDOWS' o 'SQL' en .env")
+CONNECTION_STRING = f"DRIVER={DB_DRIVER};SERVER={DB_HOST};PORT={DB_PORT};DATABASE={DB_DATABASE};UID={DB_UID};PWD={DB_PWD};"
 
-print(f"Cadena Conexión (verificación): DRIVER={DB_DRIVER};SERVER={DB_SERVER};DATABASE={DB_DATABASE};...") # Ocultar UID/PWD en logs reales
+print(f"Cadena Conexión (verificación): DRIVER={DB_DRIVER};SERVER={DB_HOST};DATABASE={DB_DATABASE};...") # Ocultar UID/PWD en logs reales
 
 # --- Modelos Pydantic ---
 class UserRegister(BaseModel):
@@ -146,11 +140,9 @@ except Exception as e:
 
 # --- Funciones Auxiliares ---
 def crear_conexion_db():
-    """Intenta crear y devolver una conexión a la BD."""
+    """Intenta crear y devolver una conexión a la BD PostgreSQL."""
     try:
-        # print("Intentando conectar a BD...") # Comentar en producción
         conn = pyodbc.connect(CONNECTION_STRING, autocommit=False)
-        # print("Conexión a BD establecida.") # Comentar en producción
         return conn
     except pyodbc.Error as ex:
         sqlstate = ex.args[0]; message = ex.args[1]
@@ -247,13 +239,12 @@ def enviar_email_verificacion(email_destino: str, codigo: str) -> bool:
 
 @app.post("/register", status_code=status.HTTP_201_CREATED,
           response_model=Dict[str, Any], # Devuelve dict porque no hay token aún
-          summary="Registra usuario, envía código (usa OUTPUT clause)", tags=["Autenticación"])
+          summary="Registra usuario, envía código (usa RETURNING)", tags=["Autenticación"])
 async def register_user(user_data: UserRegister = Body(...)):
     """
-    Registra un nuevo usuario usando OUTPUT INSERTED.usuario_id para obtener el ID.
+    Registra un nuevo usuario usando RETURNING para obtener el ID.
     Intenta enviar un correo de verificación real (ignora fallo para la respuesta).
     IMPRIME el código de verificación en la consola para pruebas.
-    Manejo explícito de conexión.
     """
     if user_data.zona_id is None and not user_data.zona_nombre_nuevo:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
@@ -267,48 +258,37 @@ async def register_user(user_data: UserRegister = Body(...)):
     try:
         conn = crear_conexion_db()
         cursor = conn.cursor()
-        # print("[Register] Conexión y cursor creados.") # DEBUG
 
         # 1. Verificar email existente
-        # print(f"[Register] Verificando email: {user_data.email}") # DEBUG
-        cursor.execute("SELECT usuario_id FROM usuarios WHERE email = ?", (user_data.email,)) # Optimizado: solo pide ID si existe
+        cursor.execute("SELECT usuario_id FROM usuarios WHERE email = ?", (user_data.email,))
         existing_user = cursor.fetchone()
         if existing_user:
-            # print(f"[Register] Email {user_data.email} ya existe (ID: {existing_user[0]}).") # DEBUG
             raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                                 detail="El correo electrónico ya está registrado.")
 
-        # 2. Resolver/Insertar Zona (usando SCOPE_IDENTITY para nueva zona)
+        # 2. Resolver/Insertar Zona (usando RETURNING para nueva zona)
         id_zona_final = user_data.zona_id
-        # print(f"[Register] Resolviendo zona: id={id_zona_final}, nombre={user_data.zona_nombre_nuevo}") # DEBUG
         if id_zona_final is None and user_data.zona_nombre_nuevo:
-            # Normalizar nombre de zona (ej: quitar espacios extra, capitalizar?)
             nombre_zona_norm = user_data.zona_nombre_nuevo.strip()
             cursor.execute("SELECT zona_id FROM zonas WHERE nombre = ?", (nombre_zona_norm,))
             zona_existente = cursor.fetchone()
             if zona_existente:
                 id_zona_final = zona_existente[0]
-                # print(f"[Register] Zona encontrada por nombre '{nombre_zona_norm}'. ID: {id_zona_final}") # DEBUG
             else:
-                # print(f"[Register] Insertando nueva zona: {nombre_zona_norm}") # DEBUG
-                # Asumiendo que 'descripcion' es NULL por defecto en la tabla zonas
-                cursor.execute("INSERT INTO zonas (nombre) VALUES (?)", (nombre_zona_norm,))
-                cursor.execute("SELECT SCOPE_IDENTITY()") # Usamos SCOPE_IDENTITY para zona ID
-                scope_id_zona = cursor.fetchval() # fetchval() es más directo para un solo valor
-                if scope_id_zona is None:
+                # Modificación: Usar RETURNING para obtener el ID
+                sql_insert_zone_with_returning = "INSERT INTO zonas (nombre) VALUES (?) RETURNING zona_id"
+                cursor.execute(sql_insert_zone_with_returning, (nombre_zona_norm,))
+                new_zone_id_obj = cursor.fetchval()
+                if new_zone_id_obj is None:
                     if conn: conn.rollback()
                     raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="No se pudo obtener el ID de la nueva zona insertada.")
-                id_zona_final = int(scope_id_zona)
-                # print(f"[Register] Nueva zona insertada con ID: {id_zona_final}") # DEBUG
+                id_zona_final = int(new_zone_id_obj)
         elif id_zona_final:
-             # Opcional: Validar que la zona_id proporcionada exista en la tabla zonas
              cursor.execute("SELECT COUNT(*) FROM zonas WHERE zona_id = ?", (id_zona_final,))
              if cursor.fetchval() == 0:
                  raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"El 'zona_id' {id_zona_final} proporcionado no existe.")
-             # print(f"[Register] Usando zona_id proporcionado: {id_zona_final}") # DEBUG
 
         # 3. Obtener Plan Básico ID
-        # print("[Register] Buscando plan 'Básico'...") # DEBUG
         cursor.execute("SELECT plan_id FROM planes WHERE nombre = ?", ('Básico',))
         plan_row = cursor.fetchone()
         if not plan_row:
@@ -317,96 +297,68 @@ async def register_user(user_data: UserRegister = Body(...)):
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                                 detail="Configuración interna: Plan por defecto 'Básico' no encontrado.")
         plan_id_default = plan_row[0]
-        # print(f"[Register] Plan 'Básico' encontrado. ID: {plan_id_default}") # DEBUG
 
         # 4. Hashear Password
         hashed_password = bcrypt.hashpw(user_data.password.encode('utf-8'), bcrypt.gensalt())
-        # print("[Register] Contraseña hasheada.") # DEBUG
 
-        # 5. Insertar Usuario Y OBTENER EL ID DIRECTAMENTE CON OUTPUT
-        # Modificamos la SQL para incluir la cláusula OUTPUT
-        sql_insert_user_with_output = """
+        # 5. Insertar Usuario Y OBTENER EL ID DIRECTAMENTE CON RETURNING
+        # Modificamos la SQL para usar la cláusula RETURNING
+        sql_insert_user_with_returning = """
             INSERT INTO usuarios (email, contrasena_hash, numero_telefono, zona_id, plan_id, email_verificado)
-            OUTPUT INSERTED.usuario_id  -- <--- Devuelve el ID insertado
             VALUES (?, ?, ?, ?, ?, ?)
+            RETURNING usuario_id  -- <--- Devuelve el ID insertado
         """
         params_user = (
              user_data.email, hashed_password.decode('utf-8'), user_data.numero_telefono,
              id_zona_final, plan_id_default, 0 # email_verificado = False (0)
         )
-        # print(f"[DEBUG] Ejecutando INSERT usuarios con OUTPUT para: {user_data.email}") # DEBUG
-
-        # Ejecutar el INSERT y obtener el ID directamente
         try:
-            # fetchval() funciona porque OUTPUT devuelve una sola columna y (esperamos) una sola fila
-            nuevo_usuario_id_obj = cursor.execute(sql_insert_user_with_output, params_user).fetchval()
+            nuevo_usuario_id_obj = cursor.execute(sql_insert_user_with_returning, params_user).fetchval()
         except pyodbc.Error as insert_err:
-            # Capturar error específico del INSERT con OUTPUT
-            print(f"[ERROR CRÍTICO] Falló el INSERT con OUTPUT para {user_data.email}. Error: {insert_err}")
-            if conn: conn.rollback() # Intentar rollback si el insert falla
+            print(f"[ERROR CRÍTICO] Falló el INSERT con RETURNING para {user_data.email}. Error: {insert_err}")
+            if conn: conn.rollback()
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Fallo al insertar el usuario en la base de datos.")
 
-        # print(f"[DEBUG] Resultado de fetchval() para INSERT con OUTPUT: {nuevo_usuario_id_obj}") # DEBUG
-
-        # Verificar si obtuvimos un ID
         if nuevo_usuario_id_obj is None:
-            print(f"[ERROR CRÍTICO] INSERT con OUTPUT devolvió None para usuario {user_data.email}. ¿El INSERT falló silenciosamente o OUTPUT no está configurado?")
-            # Si OUTPUT falla, es un problema serio. Puede indicar triggers complejos o problemas con la sesión/driver.
+            print(f"[ERROR CRÍTICO] INSERT con RETURNING devolvió None para usuario {user_data.email}. ¿El INSERT falló silenciosamente?")
             if conn: conn.rollback()
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="No se pudo obtener el ID del usuario después de insertarlo (OUTPUT devolvió None).")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="No se pudo obtener el ID del usuario después de insertarlo.")
 
         nuevo_usuario_id = int(nuevo_usuario_id_obj)
-        # --- FIN DEL CAMBIO A OUTPUT ---
-        print(f"[INFO] Usuario '{user_data.email}' insertado con ID: {nuevo_usuario_id} (obtenido con OUTPUT)")
-
+        print(f"[INFO] Usuario '{user_data.email}' insertado con ID: {nuevo_usuario_id} (obtenido con RETURNING)")
 
         # 6. Insertar Historial
-        # print(f"[Register] Insertando historial para usuario ID: {nuevo_usuario_id}") # DEBUG
-        # Tu tabla historial_planes_usuario tiene DEFAULT para fecha_cambio
         sql_insert_historial = "INSERT INTO historial_planes_usuario (usuario_id, plan_anterior_id, plan_nuevo_id, motivo) VALUES (?, NULL, ?, ?)"
         cursor.execute(sql_insert_historial, (nuevo_usuario_id, plan_id_default, 'Registro inicial'))
 
         # 7. LÓGICA DE CÓDIGO DE VERIFICACIÓN (antes del commit)
-        # print(f"[Register] Preparando código de verificación para usuario ID: {nuevo_usuario_id}") # DEBUG
         codigo = generar_codigo_verificacion()
 
-        # --- ¡NUEVO! Imprimir código en la consola ---
         print("="*70)
         print(f"|| CÓDIGO DE VERIFICACIÓN GENERADO PARA {user_data.email}: {codigo} ||")
         print("="*70)
-        # --- FIN NUEVO ---
 
         expiracion = datetime.now(timezone.utc) + timedelta(minutes=15) # UTC
-        # print(f"[Register] Eliminando código de verificación antiguo (si existe) para usuario ID: {nuevo_usuario_id}") # DEBUG
         cursor.execute("DELETE FROM verificaciones_email WHERE usuario_id = ?", (nuevo_usuario_id,))
-        # print(f"[Register] Insertando nuevo código de verificación para usuario ID: {nuevo_usuario_id}") # DEBUG
         sql_insert_codigo = "INSERT INTO verificaciones_email (usuario_id, codigo_verificacion, fecha_expiracion) VALUES (?, ?, ?)"
         cursor.execute(sql_insert_codigo, (nuevo_usuario_id, codigo, expiracion))
-        # print(f"[Register] Código de verificación '{codigo}' preparado.") # DEBUG
 
-        # 8. Commit Final (Incluye todo: usuario, historial, código)
-        # print(f"[Register] Realizando commit final para usuario ID: {nuevo_usuario_id}") # DEBUG
+        # 8. Commit Final
         conn.commit()
         commit_exitoso = True
         print(f"[INFO] Commit exitoso para registro de usuario ID: {nuevo_usuario_id}")
 
-        # 9. Intentar Enviar Email (PERO IGNORAR EL FALLO PARA LA RESPUESTA FINAL)
-        print(f"[Register] Intentando enviar email de verificación a {user_data.email} (se ignorará fallo)...") # INFO
+        # 9. Intentar Enviar Email
+        print(f"[Register] Intentando enviar email de verificación a {user_data.email} (se ignorará fallo)...")
         email_enviado = enviar_email_verificacion(user_data.email, codigo)
 
-        # --- MODIFICADO: Solo advertir si falla, no afecta la respuesta ---
         if not email_enviado:
             print(f"ADVERTENCIA (IGNORADA): El email de verificación para {user_data.email} (ID: {nuevo_usuario_id}) NO PUDO SER ENVIADO.")
             print("             (El código se mostró en consola para pruebas).")
-        # --- FIN MODIFICADO ---
 
-        # Devolver solo mensaje estándar, SIN TOKEN (incluso si el email falló)
-        # Ajustar el mensaje para indicar que el código también está en consola
         return {"mensaje": "Usuario registrado. Revisa tu correo O LA CONSOLA para obtener el código de verificación.", "usuario_id": nuevo_usuario_id}
 
-    # --- Bloques Except (Sin cambios) ---
     except HTTPException as http_err:
-        # Loggear el detalle de la excepción HTTP
         print(f"[WARN] HTTPException en /register: {http_err.status_code} - {http_err.detail}")
         if conn and not commit_exitoso:
             try:
@@ -414,10 +366,9 @@ async def register_user(user_data: UserRegister = Body(...)):
                 print("[INFO] Rollback realizado por HTTPException pre-commit.")
             except Exception as roll_err:
                 print(f"[ERROR] Error durante rollback por HTTPException: {roll_err}")
-        raise http_err # Re-lanzar para que FastAPI la maneje
+        raise http_err
 
     except pyodbc.Error as db_err:
-        # Loggear el error de base de datos específico
         err_msg = f"SQLSTATE: {db_err.args[0]} - Mensaje: {db_err.args[1]}"
         print(f"[ERROR CRÍTICO] Error de Base de Datos en /register: {err_msg}")
         if conn and not commit_exitoso:
@@ -426,14 +377,11 @@ async def register_user(user_data: UserRegister = Body(...)):
                 print("[INFO] Rollback realizado por pyodbc.Error pre-commit.")
             except Exception as roll_err:
                 print(f"[ERROR] Error durante rollback por pyodbc.Error: {roll_err}")
-        # Devolver un error genérico al cliente
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail="Error interno del servidor al procesar el registro.")
 
     except Exception as e:
-        # Capturar cualquier otro error inesperado
         print(f"[ERROR CRÍTICO] Error inesperado en /register: {e}")
-        # Considerar loggear el traceback completo
         import traceback
         traceback.print_exc()
         if conn and not commit_exitoso:
@@ -442,22 +390,18 @@ async def register_user(user_data: UserRegister = Body(...)):
                 print("[INFO] Rollback realizado por Exception pre-commit.")
             except Exception as roll_err:
                 print(f"[ERROR] Error durante rollback por Exception: {roll_err}")
-        # Devolver un error genérico al cliente
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail="Error interno inesperado durante el registro.")
 
     finally:
-        # Asegurar cierre de recursos
         if cursor:
             try:
                 cursor.close()
-                # print("Cursor cerrado en register_user.") # DEBUG
             except Exception as cur_err:
                 print(f"[ERROR] Error al cerrar cursor en register_user: {cur_err}")
         if conn:
             try:
                 conn.close()
-                # print("Conexión cerrada en register_user.") # DEBUG
             except Exception as conn_err:
                 print(f"[ERROR] Error al cerrar conexión en register_user: {conn_err}")
 
