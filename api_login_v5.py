@@ -374,8 +374,8 @@ async def read_user_profile(current_user_data: Dict[str, Any] = Depends(get_curr
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado.")
 
             return UserProfileResponse(
-                nombre_usuario=profile_data['nombre_usuario'] or "Usuario",
-                plan_descripcion=profile_data['nombre_plan'] or "desconocido"
+             nombre_usuario=profile_data['nombre_usuario'] if profile_data['nombre_usuario'] else "Usuario",
+             plan_descripcion=profile_data['nombre_plan'] if profile_data['nombre_plan'] else "desconocido"
             )
         except SQLAlchemyError as e:
             print(f"ERROR en /profile: {e}")
