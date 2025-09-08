@@ -1,7 +1,8 @@
 # Nombre de archivo sugerido: api_loggin.py
 
 import os
-import pyodbc
+import psycopg2
+import psycopg2.extras
 import bcrypt
 import jwt
 
@@ -34,14 +35,15 @@ load_dotenv()
 JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY')
 JWT_ALGORITHM = os.getenv('JWT_ALGORITHM', 'HS256')
 
-DB_HOST = os.getenv('DB_HOST')
+DATABASE_URL = os.getenv('DATABASE_URL')
 DB_DATABASE = os.getenv('DB_DATABASE')
 DB_UID = os.getenv('DB_UID')
 DB_PWD = os.getenv('DB_PWD')
 DB_PORT = os.getenv('DB_PORT', '5432') # Puerto por defecto de PostgreSQL
 DB_DRIVER = os.getenv('DB_DRIVER', '{ODBC Driver 13 for PostgreSQL}') # O el driver que uses
 
-
+if not DATABASE_URL:
+    raise ValueError("No se encontró DATABASE_URL en .env")
 
 # --- NUEVO: Configuración SMTP ---
 SMTP_SERVER = os.getenv('SMTP_SERVER')
@@ -56,8 +58,6 @@ SMTP_USE_SSL = os.getenv('SMTP_USE_SSL', 'False').lower() in ('true', '1', 't')
 # --- Validar configuración esencial ---
 if not JWT_SECRET_KEY:
     raise ValueError("No se encontró JWT_SECRET_KEY en .env")
-if not DB_HOST or not DB_DATABASE or not DB_UID or not DB_PWD:
-     raise ValueError("Faltan variables de configuración de base de datos para PostgreSQL en .env")
 # --- NUEVO: Validar Config SMTP ---
 smtp_configured = all([SMTP_SERVER, SMTP_PORT, SMTP_SENDER_EMAIL, SMTP_SENDER_PASSWORD])
 if not smtp_configured:
@@ -69,9 +69,9 @@ if not smtp_configured:
 # --- FIN NUEVO ---
 
 # --- Construir la cadena de conexión ---
-CONNECTION_STRING = f"DRIVER={DB_DRIVER};SERVER={DB_HOST};PORT={DB_PORT};DATABASE={DB_DATABASE};UID={DB_UID};PWD={DB_PWD};"
+CONNECTION_STRING = f"DRIVER={DB_DRIVER};SERVER={DATABASE_URL};PORT={DB_PORT};DATABASE={DB_DATABASE};UID={DB_UID};PWD={DB_PWD};"
 
-print(f"Cadena Conexión (verificación): DRIVER={DB_DRIVER};SERVER={DB_HOST};DATABASE={DB_DATABASE};...") # Ocultar UID/PWD en logs reales
+print(f"Cadena Conexión (verificación): DRIVER={DB_DRIVER};SERVER={DATABASE_URL};DATABASE={DB_DATABASE};...") # Ocultar UID/PWD en logs reales
 
 # --- Modelos Pydantic ---
 class UserRegister(BaseModel):
@@ -140,13 +140,13 @@ except Exception as e:
 
 # --- Funciones Auxiliares ---
 def crear_conexion_db():
-    """Intenta crear y devolver una conexión a la BD PostgreSQL."""
+    """Intenta crear y devolver una conexión a la BD PostgreSQL usando psycopg2."""
     try:
-        conn = pyodbc.connect(CONNECTION_STRING, autocommit=False)
+        # Se conecta directamente usando la URL
+        conn = psycopg2.connect(DATABASE_URL)
         return conn
-    except pyodbc.Error as ex:
-        sqlstate = ex.args[0]; message = ex.args[1]
-        print(f"ERROR CRÍTICO al conectar a la BD: SQLSTATE={sqlstate}, Mensaje={message}")
+    except psycopg2.Error as ex:
+        print(f"ERROR CRÍTICO al conectar a la BD: {ex}")
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No se pudo conectar a la base de datos.")
     except Exception as e:
         print(f"ERROR INESPERADO al conectar a la BD: {e}")
@@ -260,7 +260,7 @@ async def register_user(user_data: UserRegister = Body(...)):
         cursor = conn.cursor()
 
         # 1. Verificar email existente
-        cursor.execute("SELECT usuario_id FROM usuarios WHERE email = ?", (user_data.email,))
+        cursor.execute("SELECT usuario_id FROM usuarios WHERE email = %s", (user_data.email,))
         existing_user = cursor.fetchone()
         if existing_user:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT,
@@ -270,13 +270,13 @@ async def register_user(user_data: UserRegister = Body(...)):
         id_zona_final = user_data.zona_id
         if id_zona_final is None and user_data.zona_nombre_nuevo:
             nombre_zona_norm = user_data.zona_nombre_nuevo.strip()
-            cursor.execute("SELECT zona_id FROM zonas WHERE nombre = ?", (nombre_zona_norm,))
+            cursor.execute("SELECT zona_id FROM zonas WHERE nombre = %s", (nombre_zona_norm,))
             zona_existente = cursor.fetchone()
             if zona_existente:
                 id_zona_final = zona_existente[0]
             else:
                 # Modificación: Usar RETURNING para obtener el ID
-                sql_insert_zone_with_returning = "INSERT INTO zonas (nombre) VALUES (?) RETURNING zona_id"
+                sql_insert_zone_with_returning = "INSERT INTO zonas (nombre) VALUES (%s) RETURNING zona_id"
                 cursor.execute(sql_insert_zone_with_returning, (nombre_zona_norm,))
                 new_zone_id_obj = cursor.fetchval()
                 if new_zone_id_obj is None:
@@ -284,12 +284,12 @@ async def register_user(user_data: UserRegister = Body(...)):
                     raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="No se pudo obtener el ID de la nueva zona insertada.")
                 id_zona_final = int(new_zone_id_obj)
         elif id_zona_final:
-             cursor.execute("SELECT COUNT(*) FROM zonas WHERE zona_id = ?", (id_zona_final,))
+             cursor.execute("SELECT COUNT(*) FROM zonas WHERE zona_id = %s", (id_zona_final,))
              if cursor.fetchval() == 0:
                  raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"El 'zona_id' {id_zona_final} proporcionado no existe.")
 
         # 3. Obtener Plan Básico ID
-        cursor.execute("SELECT plan_id FROM planes WHERE nombre = ?", ('Básico',))
+        cursor.execute("SELECT plan_id FROM planes WHERE nombre = %s", ('Básico',))
         plan_row = cursor.fetchone()
         if not plan_row:
             print("[Register] ERROR CRÍTICO: Plan 'Básico' no encontrado en DB.")
@@ -305,7 +305,7 @@ async def register_user(user_data: UserRegister = Body(...)):
         # Modificamos la SQL para usar la cláusula RETURNING
         sql_insert_user_with_returning = """
             INSERT INTO usuarios (email, contrasena_hash, numero_telefono, zona_id, plan_id, email_verificado)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING usuario_id  -- <--- Devuelve el ID insertado
         """
         params_user = (
@@ -320,7 +320,7 @@ async def register_user(user_data: UserRegister = Body(...)):
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Fallo al insertar el usuario en la base de datos.")
 
         if nuevo_usuario_id_obj is None:
-            print(f"[ERROR CRÍTICO] INSERT con RETURNING devolvió None para usuario {user_data.email}. ¿El INSERT falló silenciosamente?")
+            print(f"[ERROR CRÍTICO] INSERT con RETURNING devolvió None para usuario {user_data.email}. ¿El INSERT falló silenciosamente%s")
             if conn: conn.rollback()
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="No se pudo obtener el ID del usuario después de insertarlo.")
 
@@ -328,7 +328,7 @@ async def register_user(user_data: UserRegister = Body(...)):
         print(f"[INFO] Usuario '{user_data.email}' insertado con ID: {nuevo_usuario_id} (obtenido con RETURNING)")
 
         # 6. Insertar Historial
-        sql_insert_historial = "INSERT INTO historial_planes_usuario (usuario_id, plan_anterior_id, plan_nuevo_id, motivo) VALUES (?, NULL, ?, ?)"
+        sql_insert_historial = "INSERT INTO historial_planes_usuario (usuario_id, plan_anterior_id, plan_nuevo_id, motivo) VALUES (%s, NULL, %s, %s)"
         cursor.execute(sql_insert_historial, (nuevo_usuario_id, plan_id_default, 'Registro inicial'))
 
         # 7. LÓGICA DE CÓDIGO DE VERIFICACIÓN (antes del commit)
@@ -339,8 +339,8 @@ async def register_user(user_data: UserRegister = Body(...)):
         print("="*70)
 
         expiracion = datetime.now(timezone.utc) + timedelta(minutes=15) # UTC
-        cursor.execute("DELETE FROM verificaciones_email WHERE usuario_id = ?", (nuevo_usuario_id,))
-        sql_insert_codigo = "INSERT INTO verificaciones_email (usuario_id, codigo_verificacion, fecha_expiracion) VALUES (?, ?, ?)"
+        cursor.execute("DELETE FROM verificaciones_email WHERE usuario_id = %s", (nuevo_usuario_id,))
+        sql_insert_codigo = "INSERT INTO verificaciones_email (usuario_id, codigo_verificacion, fecha_expiracion) VALUES (%s, %s, %s)"
         cursor.execute(sql_insert_codigo, (nuevo_usuario_id, codigo, expiracion))
 
         # 8. Commit Final
@@ -409,23 +409,30 @@ async def register_user(user_data: UserRegister = Body(...)):
 @app.post("/login", response_model=TokenResponse, tags=["Autenticación"])
 async def login_user(login_data: UserLogin = Body(...)):
     """ Autentica usuario. Requiere email_verificado = 1. INCLUYE plan_id en JWT. """
-    conn = None; cursor = None
+    conn = None
+    cursor = None
     try:
-        conn = crear_conexion_db(); cursor = conn.cursor()
-        # --- MODIFICADO: Seleccionar también plan_id ---
-        sql_query = "SELECT usuario_id, contrasena_hash, email_verificado, plan_id FROM usuarios WHERE email = ?"
+        conn = crear_conexion_db()
+        # Crea un cursor que devuelve filas como diccionarios (o 'DictRow')
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+        # La consulta ahora usa %s como marcador de posición
+        sql_query = "SELECT usuario_id, contrasena_hash, email_verificado, plan_id FROM usuarios WHERE email = %s"
+        
+        # Pasa los parámetros como una tupla (aunque sea de un solo elemento)
         cursor.execute(sql_query, (login_data.email,))
         user_row = cursor.fetchone()
 
         if not user_row:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas.")
 
-        usuario_id = user_row[0]
-        stored_hash = user_row[1].encode('utf-8')
-        verificado = bool(user_row[2])
-        plan_id = user_row[3] # <-- Obtener plan_id
+        # Accedemos a los datos por el nombre de la columna, es más claro y seguro
+        usuario_id = user_row['usuario_id']
+        # En psycopg2, los bytes se manejan directamente, no es necesario encode()
+        stored_hash = user_row['contrasena_hash'] 
+        verificado = bool(user_row['email_verificado'])
+        plan_id = user_row['plan_id']
 
-        # Validar si plan_id es None (no debería si la columna es NOT NULL)
         if plan_id is None:
              print(f"[Login ERROR] Usuario {login_data.email} (ID: {usuario_id}) no tiene plan_id asignado en la BD.")
              raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error interno: Falta información del plan de usuario.")
@@ -434,28 +441,28 @@ async def login_user(login_data: UserLogin = Body(...)):
             print(f"[Login Attempt] Usuario {login_data.email} (ID: {usuario_id}) intentó login SIN verificar email.")
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="La cuenta no ha sido verificada.")
 
+        # bcrypt espera que el hash sea bytes
+        if isinstance(stored_hash, str):
+            stored_hash = stored_hash.encode('utf-8')
+
         if bcrypt.checkpw(login_data.password.encode('utf-8'), stored_hash):
-            # Contraseña válida, generar token CON plan_id
             payload = {
                 'usuario_id': usuario_id,
-                'sub': login_data.email, # 'sub' es el claim estándar para "subject" (usualmente username/email)
-                'plan_id': plan_id, # <-- AÑADIDO plan_id al payload
-                'exp': datetime.now(timezone.utc) + timedelta(hours=1) # Token expira en 1 hora (ajusta si necesitas)
+                'sub': login_data.email,
+                'plan_id': plan_id,
+                'exp': datetime.now(timezone.utc) + timedelta(hours=1)
             }
             token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
             print(f"[Login Success] User {login_data.email} (ID: {usuario_id}, Plan: {plan_id}) logged in.")
-            # La respuesta no necesita incluir plan_id, ya va en el token
             return TokenResponse(mensaje="Login exitoso", token=token, usuario_id=usuario_id)
         else:
             print(f"[Login Attempt] Contraseña inválida para user {login_data.email} (ID: {usuario_id}).")
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas.")
 
     except HTTPException as http_err:
-        # Re-lanzar excepciones HTTP ya manejadas
         raise http_err
-    except pyodbc.Error as db_err:
-        err_msg = f"SQLSTATE: {db_err.args[0]} - Mensaje: {db_err.args[1]}"
-        print(f"[ERROR CRÍTICO] Error de Base de Datos en /login: {err_msg}")
+    except psycopg2.Error as db_err:
+        print(f"[ERROR CRÍTICO] Error de Base de Datos en /login: {db_err}")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Error interno del servidor durante el login.")
     except Exception as e:
         print(f"[ERROR CRÍTICO] Error inesperado en /login: {e}")
@@ -463,8 +470,10 @@ async def login_user(login_data: UserLogin = Body(...)):
         traceback.print_exc()
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Error interno inesperado durante el login.")
     finally:
-         if cursor: cursor.close() # print("Cursor cerrado login.")
-         if conn: conn.close() # print("Conexión cerrada login.")
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 
 @app.post("/verify-email", response_model=TokenResponse, summary="Verifica código y activa cuenta", tags=["Autenticación"])
@@ -477,7 +486,7 @@ async def verify_email(verify_data: VerifyEmailRequest = Body(...)):
 
         # 1. Buscar usuario, estado y ¡plan_id!
         # --- MODIFICADO: Seleccionar también plan_id ---
-        sql_get_user = "SELECT usuario_id, email_verificado, plan_id FROM usuarios WHERE email = ?"
+        sql_get_user = "SELECT usuario_id, email_verificado, plan_id FROM usuarios WHERE email = %s"
         cursor.execute(sql_get_user, (verify_data.email,))
         user_row = cursor.fetchone()
         if not user_row: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado.")
@@ -495,10 +504,10 @@ async def verify_email(verify_data: VerifyEmailRequest = Body(...)):
 
         # 2. Buscar código de verificación
         # ... (código para buscar code_row igual que antes) ...
-        sql_get_code = "SELECT codigo_verificacion, fecha_expiracion FROM verificaciones_email WHERE usuario_id = ?"
+        sql_get_code = "SELECT codigo_verificacion, fecha_expiracion FROM verificaciones_email WHERE usuario_id = %s"
         cursor.execute(sql_get_code, (usuario_id,))
         code_row = cursor.fetchone()
-        if not code_row: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se encontró código pendiente (¿expirado o ya usado?).")
+        if not code_row: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se encontró código pendiente (¿expirado o ya usado%s).")
 
         stored_code = code_row[0]
         expires_at_from_db = code_row[1]
@@ -514,7 +523,7 @@ async def verify_email(verify_data: VerifyEmailRequest = Body(...)):
         # 4. Actualizar usuario (si no estaba verificado)
         # 4. Actualizar usuario (si no estaba verificado)
         if not estaba_verificado:
-         sql_update_user = "UPDATE usuarios SET email_verificado = 1 WHERE usuario_id = ?"
+         sql_update_user = "UPDATE usuarios SET email_verificado = 1 WHERE usuario_id = %s"
         cursor.execute(sql_update_user, (usuario_id,))
 
         # --- INICIO SECCIÓN CORREGIDA ---
@@ -540,9 +549,9 @@ async def verify_email(verify_data: VerifyEmailRequest = Body(...)):
         print(f"[Verify INFO] User {verify_data.email} (ID: {usuario_id}) marcado como verificado.")
 
         # 5. Borrar código usado
-        sql_delete_code = "DELETE FROM verificaciones_email WHERE usuario_id = ?"
+        sql_delete_code = "DELETE FROM verificaciones_email WHERE usuario_id = %s"
         cursor.execute(sql_delete_code, (usuario_id,))
-        if cursor.rowcount == 0: print(f"[Verify WARN] No se borró código para user ID {usuario_id} (¿ya borrado?).")
+        if cursor.rowcount == 0: print(f"[Verify WARN] No se borró código para user ID {usuario_id} (¿ya borrado%s).")
 
         # 6. Commit
         conn.commit(); commit_exitoso = True
@@ -598,7 +607,7 @@ async def get_zonas(q: Optional[str] = Query(None, min_length=1, max_length=50, 
     try:
         conn = crear_conexion_db(); cursor = conn.cursor()
         if q:
-            sql_query = "SELECT zona_id, nombre FROM zonas WHERE nombre LIKE ? ORDER BY nombre"
+            sql_query = "SELECT zona_id, nombre FROM zonas WHERE nombre LIKE %s ORDER BY nombre"
             # Añadir wildcards para búsqueda parcial
             search_pattern = f"%{q}%"
             cursor.execute(sql_query, (search_pattern,))
@@ -780,12 +789,12 @@ async def read_user_profile(
 
         # --- Consulta a la BD para obtener nombre_usuario y plan_id ---
         # Asumiendo que las columnas son 'nombre_usuario' y 'plan_id'
-        sql_query = "SELECT nombre_usuario, plan_id FROM usuarios WHERE usuario_id = ?"
+        sql_query = "SELECT nombre_usuario, plan_id FROM usuarios WHERE usuario_id = %s"
         cursor.execute(sql_query, (usuario_id,))
         user_row = cursor.fetchone()
 
         if not user_row:
-            print(f"API /profile Error: Usuario con ID {usuario_id} no encontrado en BD (token válido pero usuario inexistente?).")
+            print(f"API /profile Error: Usuario con ID {usuario_id} no encontrado en BD (token válido pero usuario inexistente%s).")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado.")
 
         # Acceso por nombre de columna (si tu cursor lo permite) o índice

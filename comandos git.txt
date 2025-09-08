@@ -1,3 +1,6 @@
 git add .
 git commit -m "descripcion del cambio"
 git push
+
+
+git commit -m "adaptada a postgreSQL"
