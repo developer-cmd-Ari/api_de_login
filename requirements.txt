@@ -22,6 +22,7 @@ pycparser==2.22
 pydantic==2.11.7
 pydantic_core==2.33.2
 PyJWT==2.10.1
+pyodbc==5.2.0
 python-dotenv==1.1.1
 python-jose==3.5.0
 PyYAML==6.0.2
@@ -35,4 +36,3 @@ typing_extensions==4.15.0
 uvicorn==0.35.0
 watchfiles==1.1.0
 websockets==15.0.1
-pyodbc==5.1.0
